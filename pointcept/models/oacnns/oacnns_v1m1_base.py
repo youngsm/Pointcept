@@ -2,7 +2,7 @@ from functools import partial
 import torch
 import torch.nn as nn
 import spconv.pytorch as spconv
-from timm.layers import trunc_normal_
+from timm.models.layers import trunc_normal_
 from ..builder import MODELS
 from ..utils import offset2batch
 from torch_geometric.nn.pool import voxel_grid

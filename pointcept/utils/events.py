@@ -16,8 +16,13 @@ import torch
 import numpy as np
 import traceback
 import sys
+try:
+    import wandb
+except ImportError:
+    wandb = None
+import matplotlib.pyplot as plt
 
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict, Any, Union
 from collections import defaultdict
 from contextlib import contextmanager
 
@@ -28,6 +33,8 @@ __all__ = [
     "CommonMetricPrinter",
     "EventStorage",
     "ExceptionWriter",
+    "WandbWriter",
+    "WandbSummaryWriter",
 ]
 
 _CURRENT_STORAGE_STACK = []
@@ -610,3 +617,366 @@ class ExceptionWriter:
             formatted_tb_str = "".join(tb)
             self.logger.error(formatted_tb_str)
             sys.exit(1)  # This prevents double logging the error to the console
+
+
+class WandbWriter(EventWriter):
+    """
+    Write all scalars to Weights & Biases.
+    """
+
+    def __init__(
+        self,
+        window_size: int = 20,
+        project: Optional[str] = None,
+        name: Optional[str] = None,
+        config: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ):
+        """
+        Args:
+            window_size (int): the scalars will be median-smoothed by this window size
+            project (str): W&B project name
+            name (str): W&B run name
+            config (dict): Dictionary of configuration parameters for the run
+            kwargs: other arguments passed to `wandb.init(...)`
+        """
+        if wandb is None:
+            raise ImportError(
+                "To use WandbWriter, please install wandb using: pip install wandb"
+            )
+        
+        self._window_size = window_size
+        self._wandb_initialized = False
+        self._wandb_kwargs = {
+            "project": project,
+            "name": name,
+            "config": config,
+            **kwargs
+        }
+        self._last_write = -1
+
+    def _initialize_wandb(self):
+        if not self._wandb_initialized:
+            wandb.init(**self._wandb_kwargs)
+            self._wandb_initialized = True
+
+    def write(self):
+        storage = get_event_storage()
+        
+        if not self._wandb_initialized:
+            self._initialize_wandb()
+            
+        new_last_write = self._last_write
+        for k, (v, iter) in storage.latest_with_smoothing_hint(
+            self._window_size
+        ).items():
+            if iter > self._last_write:
+                wandb.log({k: v}, step=iter)
+                new_last_write = max(new_last_write, iter)
+        self._last_write = new_last_write
+        
+        # Log images if present
+        if len(storage._vis_data) >= 1:
+            for img_name, img, step_num in storage._vis_data:
+                wandb.log({img_name: wandb.Image(img)}, step=step_num)
+            # Storage stores all image data and rely on this writer to clear them.
+            # As a result it assumes only one writer will use its image data.
+            # An alternative design is to let storage store limited recent
+            # data (e.g. only the most recent image) that all writers can access.
+            # In that case a writer may not see all image data if its period is long.
+            storage.clear_images()
+
+        # Log histograms if present
+        if len(storage._histograms) >= 1:
+            for params in storage._histograms:
+                tag = params.get("tag")
+                if tag is not None:
+                    data = np.zeros(len(params.get("bucket_counts", [])))
+                    for i, count in enumerate(params.get("bucket_counts", [])):
+                        data[i] = count
+                    wandb.log({tag: wandb.Histogram(
+                        np_histogram=(data, params.get("bucket_limits", [])),
+                    )}, step=params.get("global_step"))
+            storage.clear_histograms()
+
+    def close(self):
+        if self._wandb_initialized:
+            wandb.finish()
+
+
+class WandbSummaryWriter:
+    """
+    Emulates the TensorBoard SummaryWriter API but logs to Weights & Biases.
+    """
+    
+    def __init__(
+        self,
+        log_dir=None,
+        comment="",
+        purge_step=None,
+        max_queue=10,
+        flush_secs=120,
+        filename_suffix="",
+        **kwargs
+    ):
+        """
+        Initialize a wandb run.
+        
+        Args:
+            log_dir: Optional directory for logs (used for compatibility, wandb uses its own directory)
+            comment: Optional comment (used for compatibility)
+            purge_step: Compatibility parameter, not used
+            max_queue: Compatibility parameter, not used
+            flush_secs: Compatibility parameter, not used
+            filename_suffix: Compatibility parameter, not used
+            **kwargs: Additional arguments passed to wandb.init
+        """
+        self.run = None
+        if not wandb.run:
+            if log_dir:
+                kwargs.setdefault('dir', log_dir)
+            if comment:
+                kwargs.setdefault('notes', comment)
+            self.run = wandb.init(**kwargs)
+        else:
+            self.run = wandb.run
+            
+        self.step = 0
+    
+    def add_scalar(
+        self,
+        tag,
+        scalar_value,
+        global_step=None,
+        walltime=None,
+        new_style=False,
+        double_precision=False,
+    ):
+        """Log a scalar value."""
+        step = global_step if global_step is not None else self.step
+        wandb.log({tag: scalar_value}, step=step)
+        if global_step is None:
+            self.step += 1
+    
+    def add_scalars(
+        self,
+        main_tag,
+        tag_scalar_dict,
+        global_step=None,
+        walltime=None
+    ):
+        """Log multiple scalars at once."""
+        step = global_step if global_step is not None else self.step
+        log_dict = {f"{main_tag}/{tag}": value 
+                   for tag, value in tag_scalar_dict.items()}
+        wandb.log(log_dict, step=step)
+        if global_step is None:
+            self.step += 1
+    
+    def add_histogram(
+        self,
+        tag,
+        values,
+        global_step=None,
+        bins='tensorflow',
+        walltime=None,
+        max_bins=None,
+    ):
+        """Log a histogram."""
+        step = global_step if global_step is not None else self.step
+        
+        if isinstance(values, torch.Tensor):
+            values = values.detach().cpu().numpy()
+            
+        wandb.log({tag: wandb.Histogram(values)}, step=step)
+        if global_step is None:
+            self.step += 1
+    
+    def add_image(
+        self,
+        tag,
+        img_tensor,
+        global_step=None,
+        walltime=None,
+        dataformats="CHW"
+    ):
+        """Log an image."""
+        step = global_step if global_step is not None else self.step
+        
+        if isinstance(img_tensor, torch.Tensor):
+            img_tensor = img_tensor.detach().cpu().numpy()
+            
+        wandb.log({tag: wandb.Image(img_tensor, dataformats=dataformats)}, step=step)
+        if global_step is None:
+            self.step += 1
+    
+    def add_images(
+        self,
+        tag,
+        img_tensor,
+        global_step=None,
+        walltime=None,
+        dataformats="NCHW"
+    ):
+        """Log multiple images."""
+        step = global_step if global_step is not None else self.step
+        
+        if isinstance(img_tensor, torch.Tensor):
+            img_tensor = img_tensor.detach().cpu().numpy()
+            
+        if dataformats == "NCHW":
+            # Convert to a list of images
+            images = [img for img in img_tensor]
+            wandb.log({tag: [wandb.Image(img, dataformats="CHW") for img in images]}, step=step)
+        else:
+            wandb.log({tag: [wandb.Image(img, dataformats=dataformats) for img in img_tensor]}, step=step)
+            
+        if global_step is None:
+            self.step += 1
+    
+    def add_figure(
+        self,
+        tag,
+        figure,
+        global_step=None,
+        close=True,
+        walltime=None,
+    ):
+        """Log a matplotlib figure."""
+        step = global_step if global_step is not None else self.step
+        
+        wandb.log({tag: wandb.Image(figure)}, step=step)
+        
+        if close:
+            plt.close(figure)
+            
+        if global_step is None:
+            self.step += 1
+    
+    def add_text(
+        self,
+        tag,
+        text_string,
+        global_step=None,
+        walltime=None
+    ):
+        """Log text."""
+        step = global_step if global_step is not None else self.step
+        
+        wandb.log({tag: wandb.Html(f"<pre>{text_string}</pre>")}, step=step)
+        
+        if global_step is None:
+            self.step += 1
+    
+    def add_video(
+        self,
+        tag,
+        vid_tensor,
+        global_step=None,
+        fps=4,
+        walltime=None
+    ):
+        """Log a video."""
+        step = global_step if global_step is not None else self.step
+        
+        if isinstance(vid_tensor, torch.Tensor):
+            vid_tensor = vid_tensor.detach().cpu().numpy()
+            
+        # wandb expects [time, channels, height, width]
+        wandb.log({tag: wandb.Video(vid_tensor, fps=fps)}, step=step)
+        
+        if global_step is None:
+            self.step += 1
+    
+    def add_embedding(
+        self,
+        mat,
+        metadata=None,
+        label_img=None,
+        global_step=None,
+        tag="default",
+        metadata_header=None,
+    ):
+        """Log embeddings - use wandb.plot.scatter for this functionality"""
+        step = global_step if global_step is not None else self.step
+        
+        if isinstance(mat, torch.Tensor):
+            mat = mat.detach().cpu().numpy()
+            
+        # Create a custom 2D/3D scatter plot in wandb
+        if mat.shape[1] > 3:
+            # If high-dimensional, log a simple message
+            wandb.log({f"{tag}_embedding_logged": True}, step=step)
+            print(f"Note: High-dimensional embeddings ({mat.shape[1]}D) aren't visualized directly in wandb.")
+            print("Consider using UMAP or t-SNE to reduce to 2D/3D before logging.")
+        else:
+            # Basic table with embeddings
+            data = [[idx] + list(row) for idx, row in enumerate(mat)]
+            table = wandb.Table(columns=["id"] + [f"dim_{i}" for i in range(mat.shape[1])], data=data)
+            wandb.log({tag: table}, step=step)
+        
+        if global_step is None:
+            self.step += 1
+
+    def add_pr_curve(
+        self,
+        tag,
+        labels,
+        predictions,
+        global_step=None,
+        num_thresholds=127,
+        weights=None,
+        walltime=None,
+    ):
+        """Log precision-recall curve"""
+        # Note: W&B has wandb.plot.pr_curve but it needs actual predictions/labels
+        # This is a compatibility stub
+        print("Precision-Recall curves are tracked through wandb.log({'pr': wandb.plot.pr_curve(...)})")
+        
+    def add_mesh(
+        self,
+        tag,
+        vertices,
+        colors=None,
+        faces=None,
+        config_dict=None,
+        global_step=None,
+        walltime=None,
+    ):
+        """Log 3D mesh (not directly supported in wandb API)"""
+        print("3D meshes are not directly supported in W&B's Python API")
+        
+    def add_hparams(
+        self,
+        hparam_dict,
+        metric_dict,
+        hparam_domain_discrete=None,
+        run_name=None,
+        global_step=None,
+    ):
+        """Log hyperparameters and metrics"""
+        # wandb tracks hyperparameters automatically through config
+        for key, value in hparam_dict.items():
+            self.run.config[key] = value
+            
+        # Log metrics
+        step = global_step if global_step is not None else self.step
+        wandb.log(metric_dict, step=step)
+        
+        if global_step is None:
+            self.step += 1
+            
+    def flush(self):
+        """Flush is automatically handled by wandb"""
+        pass
+    
+    def close(self):
+        """Finish logging (optional, wandb handles this automatically)"""
+        if self.run:
+            wandb.finish()
+            
+    def __enter__(self):
+        return self
+        
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()

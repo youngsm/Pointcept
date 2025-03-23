@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.nn.init import trunc_normal_
 import spconv.pytorch as spconv
 import torch_scatter
-from timm.layers import DropPath
+from timm.models.layers import DropPath
 
 try:
     import flash_attn

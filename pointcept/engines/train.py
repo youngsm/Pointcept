@@ -28,7 +28,7 @@ from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.optimizer import build_optimizer
 from pointcept.utils.scheduler import build_scheduler
-from pointcept.utils.events import EventStorage, ExceptionWriter
+from pointcept.utils.events import EventStorage, ExceptionWriter, WandbSummaryWriter
 from pointcept.utils.registry import Registry
 
 
@@ -245,8 +245,16 @@ class Trainer(TrainerBase):
         return model
 
     def build_writer(self):
-        writer = SummaryWriter(self.cfg.save_path) if comm.is_main_process() else None
-        self.logger.info(f"Tensorboard writer logging dir: {self.cfg.save_path}")
+        if self.cfg.get('use_wandb', False):
+            writer = WandbSummaryWriter(
+                project=self.cfg.get('wandb_project', 'pointcept'),
+                name=self.cfg.get('wandb_run_name', os.path.basename(self.cfg.save_path)),
+                config=self.cfg
+            ) if comm.is_main_process() else None
+            self.logger.info(f"Weights & Biases writer initialized with project: {self.cfg.get('wandb_project', 'pointcept')}")
+        else:
+            writer = SummaryWriter(self.cfg.save_path) if comm.is_main_process() else None
+            self.logger.info(f"Tensorboard writer logging dir: {self.cfg.save_path}")
         return writer
 
     def build_train_loader(self):

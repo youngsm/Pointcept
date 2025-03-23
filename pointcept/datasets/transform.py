@@ -153,6 +153,17 @@ class NormalizeCoord(object):
             data_dict["coord"] = data_dict["coord"] / m
         return data_dict
 
+@TRANSFORMS.register_module()
+class NormalizePILArNet(object):
+    def __call__(self, data_dict):
+        if "coord" in data_dict.keys():
+            # modified from pointnet2
+            centroid = np.array([384.0, 384.0, 384.0])
+            data_dict["coord"] -= centroid
+            m = 768 * np.sqrt(3) / 2
+            data_dict["coord"] = data_dict["coord"] / m
+        return data_dict
+
 
 @TRANSFORMS.register_module()
 class PositiveShift(object):

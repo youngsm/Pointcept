@@ -20,5 +20,8 @@ from .waymo import WaymoDataset
 from .modelnet import ModelNetDataset
 from .shapenet_part import ShapeNetPartDataset
 
+# physics
+from .pilarnet import PILArNetH5Dataset
+
 # dataloader
 from .dataloader import MultiDatasetDataloader
