@@ -1,3 +1,0 @@
-"""
-PILArNet preprocessing module.
-""" 
