@@ -86,7 +86,7 @@ model = dict(
 
 # scheduler settings
 epoch = 60
-base_lr = 0.004
+base_lr = 0.004 / 4
 lr_decay = 0.9  # layer-wise lr decay
 
 base_wd = 0.04  # wd scheduler enable in hooks
