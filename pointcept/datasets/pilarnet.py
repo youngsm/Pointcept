@@ -44,11 +44,13 @@ class PILArNetH5Dataset(Dataset):
         test_cfg=None,
         loop=1,
         ignore_index=-1,
-        emin=1.0e-2,
-        emax=20.0,
         energy_threshold=0.0,
         min_points=1024,
+        max_len=-1,
         remove_low_energy_scatters=False,
+        generate_queries=False,
+        num_queries=5,
+        query_mask_ratio=0.3,
     ):
         super().__init__()
         self.data_root = data_root
@@ -68,14 +70,13 @@ class PILArNetH5Dataset(Dataset):
             self.aug_transform = [Compose(aug) for aug in self.test_cfg.aug_transform]
 
         # PILArNet specific parameters
-        self.emin = emin
-        self.emax = emax
         self.energy_threshold = energy_threshold
         self.min_points = min_points
         self.remove_low_energy_scatters = remove_low_energy_scatters
-        
+        self.max_len = max_len
         # Get list of h5 files
         self.h5_files = self.get_h5_files()
+        assert len(self.h5_files) > 0, "No h5 files found"
         self.initted = False
         
         # Build index for faster access
@@ -87,6 +88,11 @@ class PILArNetH5Dataset(Dataset):
                 self.cumulative_lengths[-1], self.loop, split
             )
         )
+        
+        # Instance segmentation parameters
+        self.generate_queries = generate_queries
+        self.num_queries = num_queries
+        self.query_mask_ratio = query_mask_ratio
     
     def get_h5_files(self):
         """Get list of h5 files based on the split."""
@@ -147,12 +153,52 @@ class PILArNetH5Dataset(Dataset):
             self.h5data.append(h5py.File(h5_file, mode="r", libver="latest", swmr=True))
         self.initted = True
     
-    def log_transform(self, x):
-        """Transform energy to logarithmic scale on [-1,1]"""
-        # [emin, emax] -> [-1,1]
-        y0 = np.log10(self.emin)
-        y1 = np.log10(self.emin + self.emax)
-        return 2 * (np.log10(x + self.emin) - y0) / (y1 - y0) - 1
+    def get_queries(self, data_dict):
+        """Generate instance segmentation queries from a point cloud.
+        
+        Args:
+            data_dict (dict): Dictionary containing point cloud data including instances
+            
+        Returns:
+            list: List of data dictionaries, one for each query
+        """
+        if not self.generate_queries:
+            return [data_dict]
+
+        instance_ids = np.unique(data_dict["instance"].flatten())
+        instance_ids = instance_ids[instance_ids > 0]  # Exclude background/invalid
+        if len(instance_ids) > self.num_queries:
+            selected_ids = np.random.choice(instance_ids, self.num_queries, replace=False)
+        else:
+            selected_ids = instance_ids[:self.num_queries]
+
+        result = []
+        for instance_id in selected_ids:
+            instance_dict = deepcopy(data_dict)            
+            full_mask = (instance_dict["instance"].flatten() == instance_id).astype(np.float32)
+            
+            # create corrupted query mask
+            mask_indices = np.where(full_mask)[0]
+            if len(mask_indices) > 0:
+                keep_indices = np.random.choice(
+                    mask_indices, 
+                    size=max(1, int(self.query_mask_ratio * len(mask_indices))), 
+                    replace=False
+                )
+                query_mask = np.zeros_like(full_mask)
+                query_mask[keep_indices] = 1.0
+                instance_dict["query_mask"] = query_mask[:, None] # (N, 1)
+                instance_dict["query_truth"] = full_mask[:, None] # (N, 1)
+                instance_dict["query_instance_id"] = np.array([instance_id])
+                result.append(instance_dict)
+        
+        if not result:
+            data_dict["query_mask"] = np.zeros((data_dict["instance"].shape[0], 1), dtype=np.float32)
+            data_dict["query_truth"] = np.zeros((data_dict["instance"].shape[0], 1), dtype=np.float32)
+            data_dict["query_instance_id"] = np.array([-1])
+            result = [data_dict]
+            
+        return result
     
     def get_data(self, idx):
         """Load a point cloud from h5 file."""
@@ -187,6 +233,7 @@ class PILArNetH5Dataset(Dataset):
             threshold_mask = data[:, 3] > self.energy_threshold
             data = data[threshold_mask]
             data_semantic_id = data_semantic_id[threshold_mask]
+            data_group_id = data_group_id[threshold_mask]
             
             if data.shape[0] < self.min_points:
                 # Try another data point if this one is too small after filtering
@@ -234,15 +281,14 @@ class PILArNetH5Dataset(Dataset):
     
     def prepare_train_data(self, idx):
         """Prepare training data with transforms."""
-        # Load data
         data_dict = self.get_data(idx % len(self))
-        
-        # Apply transforms
-        if self.transform is not None:
-            data_dict = self.transform(data_dict)
-            
-        return data_dict
-    
+        if self.generate_queries:
+            data_dicts = self.get_queries(data_dict)
+            if self.transform is not None:
+                data_dicts = [self.transform(data_dict) for data_dict in data_dicts]
+            return data_dicts
+        return self.transform(data_dict)
+                
     def prepare_test_data(self, idx):
         """Prepare test data with test transforms."""
         # Load data
@@ -279,7 +325,7 @@ class PILArNetH5Dataset(Dataset):
 
         for i in range(len(fragment_list)):
             fragment_list[i] = self.post_transform(fragment_list[i])
-        result_dict["fragment_list"] = fragment_list
+        result_dict["fragment_list"] = self.get_queries(fragment_list)
         return result_dict
         
     def __getitem__(self, idx):
@@ -290,6 +336,8 @@ class PILArNetH5Dataset(Dataset):
             return self.prepare_train_data(real_idx)
     
     def __len__(self):
+        if self.max_len > 0:
+            return min(self.max_len, self.cumulative_lengths[-1]) * self.loop
         return self.cumulative_lengths[-1] * self.loop
     
     def __del__(self):

@@ -23,14 +23,13 @@ from tensorboardX import SummaryWriter
 from .defaults import create_ddp_model, worker_init_fn
 from .hooks import HookBase, build_hooks
 import pointcept.utils.comm as comm
-from pointcept.datasets import build_dataset, point_collate_fn, collate_fn
+from pointcept.datasets import build_dataset, point_collate_fn, collate_fn, inseg_collate_fn
 from pointcept.models import build_model
 from pointcept.utils.logger import get_root_logger
 from pointcept.utils.optimizer import build_optimizer
 from pointcept.utils.scheduler import build_scheduler
 from pointcept.utils.events import EventStorage, ExceptionWriter, WandbSummaryWriter
 from pointcept.utils.registry import Registry
-
 
 TRAINERS = Registry("trainers")
 AMP_DTYPE = dict(
@@ -282,7 +281,7 @@ class Trainer(TrainerBase):
             shuffle=(train_sampler is None),
             num_workers=self.cfg.num_worker_per_gpu,
             sampler=train_sampler,
-            collate_fn=partial(point_collate_fn, mix_prob=self.cfg.mix_prob),
+            collate_fn=partial(collate_fn, mix_prob=self.cfg.mix_prob),
             pin_memory=True,
             worker_init_fn=init_fn,
             drop_last=len(train_data) > self.cfg.batch_size,
@@ -343,3 +342,62 @@ class MultiDatasetTrainer(Trainer):
         )
         self.comm_info["iter_per_epoch"] = len(train_loader)
         return train_loader
+
+
+@TRAINERS.register_module("InsegTrainer")
+class InsegTrainer(Trainer):
+    """Trainer for instance segmentation that handles multiple queries per sample."""
+    
+    def build_train_loader(self):
+        train_data = build_dataset(self.cfg.data.train)
+
+        if comm.get_world_size() > 1:
+            train_sampler = torch.utils.data.distributed.DistributedSampler(train_data)
+        else:
+            train_sampler = None
+
+        init_fn = (
+            partial(
+                worker_init_fn,
+                num_workers=self.cfg.num_worker_per_gpu,
+                rank=comm.get_rank(),
+                seed=self.cfg.seed,
+            )
+            if self.cfg.seed is not None
+            else None
+        )
+
+        # Use our custom collate function for instance segmentation
+        train_loader = torch.utils.data.DataLoader(
+            train_data,
+            batch_size=self.cfg.batch_size_per_gpu,
+            shuffle=(train_sampler is None),
+            num_workers=self.cfg.num_worker_per_gpu,
+            sampler=train_sampler,
+            collate_fn=partial(inseg_collate_fn, mix_prob=self.cfg.mix_prob),
+            pin_memory=True,
+            worker_init_fn=init_fn,
+            drop_last=len(train_data) > self.cfg.batch_size,
+            persistent_workers=True,
+        )
+        return train_loader
+    
+    def build_val_loader(self):
+        val_loader = None
+        if self.cfg.evaluate:
+            val_data = build_dataset(self.cfg.data.val)
+            if comm.get_world_size() > 1:
+                val_sampler = torch.utils.data.distributed.DistributedSampler(val_data)
+            else:
+                val_sampler = None
+            val_loader = torch.utils.data.DataLoader(
+                val_data,
+                batch_size=self.cfg.batch_size_val_per_gpu,
+                shuffle=False,
+                num_workers=self.cfg.num_worker_per_gpu,
+                pin_memory=True,
+                sampler=val_sampler,
+                # Use inseg_collate_fn for validation as well
+                collate_fn=partial(inseg_collate_fn, mix_prob=0),
+            )
+        return val_loader

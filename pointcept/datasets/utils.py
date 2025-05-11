@@ -75,3 +75,24 @@ def point_collate_fn(batch, mix_prob=0):
 
 def gaussian_kernel(dist2: np.array, a: float = 1, c: float = 5):
     return a * np.exp(-dist2 / (2 * c**2))
+
+
+def inseg_collate_fn(batch, mix_prob=0):
+    """
+    Collate function for instance segmentation that handles lists of data dictionaries.
+    Each item in the batch is a list of data dictionaries (one per query).
+    """
+    assert isinstance(
+        batch[0], list
+    )  # currently, only support input_dict, rather than input_list
+    assert isinstance(
+        batch[0][0], Mapping
+    )  # currently, only support input_dict, rather than input_list
+    # Flatten the batch - each item is already a list of dictionaries
+
+    flattened_batch = []
+    for item_list in batch:
+        flattened_batch.extend(item_list)
+    
+    # Use the original collate function on the flattened batch
+    return collate_fn(flattened_batch)

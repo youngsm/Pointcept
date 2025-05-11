@@ -17,7 +17,6 @@ from pointcept.utils.misc import intersection_and_union_gpu
 from .default import HookBase
 from .builder import HOOKS
 
-
 @HOOKS.register_module()
 class ClsEvaluator(HookBase):
     def after_epoch(self):
@@ -104,16 +103,26 @@ class ClsEvaluator(HookBase):
 
 @HOOKS.register_module()
 class SemSegEvaluator(HookBase):
-    def __init__(self, write_cls_iou=False):
+    def __init__(self, write_cls_iou=False, every_n_epochs=1):
         self.write_cls_iou = write_cls_iou
+        self.every_n_epochs = every_n_epochs
 
     def after_epoch(self):
         if self.trainer.cfg.evaluate:
-            self.eval()
+            if self.every_n_epochs == 0:
+                self.eval()
+            else:
+                if (self.trainer.epoch + 1) % self.every_n_epochs == 0:
+                    self.eval()
 
     def eval(self):
         self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
         self.trainer.model.eval()
+        
+        # Store predictions and ground truth for computing metrics
+        all_preds = []
+        all_segments = []
+        
         for i, input_dict in enumerate(self.trainer.val_loader):
             for key in input_dict.keys():
                 if isinstance(input_dict[key], torch.Tensor):
@@ -134,6 +143,13 @@ class SemSegEvaluator(HookBase):
                 )
                 pred = pred[idx.flatten().long()]
                 segment = input_dict["origin_segment"]
+
+            segment = segment.squeeze(-1)
+            
+            # Store predictions and ground truth
+            all_preds.append(pred.cpu())
+            all_segments.append(segment.cpu())
+            
             intersection, union, target = intersection_and_union_gpu(
                 pred,
                 segment,
@@ -165,6 +181,47 @@ class SemSegEvaluator(HookBase):
                     iter=i + 1, max_iter=len(self.trainer.val_loader), loss=loss.item()
                 )
             )
+        
+        # Compute metrics from all predictions and ground truth
+        if comm.get_world_size() > 1:
+            all_preds_gathered = comm.gather(all_preds, dst=0)
+            all_segments_gathered = comm.gather(all_segments, dst=0)
+            if comm.get_rank() == 0:
+                all_preds = [p for preds in all_preds_gathered for p in preds]
+                all_segments = [s for segments in all_segments_gathered for s in segments]
+        
+        # Concatenate all predictions and ground truth
+        all_preds = torch.cat(all_preds, dim=0).numpy()
+        all_segments = torch.cat(all_segments, dim=0).numpy()
+        
+        # Compute per-class metrics
+        num_classes = self.trainer.cfg.data.num_classes
+        precision_class = np.zeros(num_classes)
+        recall_class = np.zeros(num_classes)
+        f1_class = np.zeros(num_classes)
+        
+        for i in range(num_classes):
+            # True positives, false positives, false negatives
+            pred_i = (all_preds == i)
+            gt_i = (all_segments == i)
+            if gt_i.sum() > 0 or pred_i.sum() > 0:
+                tp = np.logical_and(pred_i, gt_i).sum()
+                fp = np.logical_and(pred_i, np.logical_not(gt_i)).sum()
+                fn = np.logical_and(np.logical_not(pred_i), gt_i).sum()
+                
+                precision = tp / (tp + fp + 1e-10)
+                recall = tp / (tp + fn + 1e-10)
+                f1 = 2 * precision * recall / (precision + recall + 1e-10)
+                
+                precision_class[i] = precision
+                recall_class[i] = recall
+                f1_class[i] = f1
+        
+        m_precision = np.mean(precision_class)
+        m_recall = np.mean(recall_class)
+        m_f1 = np.mean(f1_class)
+        
+        # Get IoU and Acc from storage
         loss_avg = self.trainer.storage.history("val_loss").avg
         intersection = self.trainer.storage.history("val_intersection").total
         union = self.trainer.storage.history("val_union").total
@@ -174,32 +231,64 @@ class SemSegEvaluator(HookBase):
         m_iou = np.mean(iou_class)
         m_acc = np.mean(acc_class)
         all_acc = sum(intersection) / (sum(target) + 1e-10)
+        
         self.trainer.logger.info(
-            "Val result: mIoU/mAcc/allAcc {:.4f}/{:.4f}/{:.4f}.".format(
-                m_iou, m_acc, all_acc
+            "Val result: mIoU/mAcc/allAcc/mPrec/mRec/mF1 {:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}.".format(
+                m_iou, m_acc, all_acc, m_precision, m_recall, m_f1
             )
         )
+        # Create a pretty table with per-class metrics
+        table_header = "| Class ID | Class Name | IoU | Accuracy | Precision | Recall | F1 |"
+        table_separator = "|" + "-" * 10 + "|" + "-" * 12 + "|" + "-" * 8 + "|" + "-" * 10 + "|" + "-" * 11 + "|" + "-" * 8 + "|" + "-" * 6 + "|"
+        
+        self.trainer.logger.info("Per-class metrics:")
+        self.trainer.logger.info(table_header)
+        self.trainer.logger.info(table_separator)
+        
         for i in range(self.trainer.cfg.data.num_classes):
             self.trainer.logger.info(
-                "Class_{idx}-{name} Result: iou/accuracy {iou:.4f}/{accuracy:.4f}".format(
+                "| {idx:8d} | {name:10s} | {iou:.4f} | {accuracy:.4f} | {precision:.4f} | {recall:.4f} | {f1:.4f} |".format(
                     idx=i,
                     name=self.trainer.cfg.data.names[i],
                     iou=iou_class[i],
                     accuracy=acc_class[i],
+                    precision=precision_class[i],
+                    recall=recall_class[i],
+                    f1=f1_class[i]
                 )
             )
-        current_epoch = self.trainer.epoch + 1
+        # current_iter = self.trainer.model.momentum_scheduler.iter
         if self.trainer.writer is not None:
-            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
-            self.trainer.writer.add_scalar("val/mIoU", m_iou, current_epoch)
-            self.trainer.writer.add_scalar("val/mAcc", m_acc, current_epoch)
-            self.trainer.writer.add_scalar("val/allAcc", all_acc, current_epoch)
+            self.trainer.writer.add_scalar("val/loss", loss_avg,)# current_iter)
+            self.trainer.writer.add_scalar("val/mIoU", m_iou,)# current_iter)
+            self.trainer.writer.add_scalar("val/mAcc", m_acc,)# current_iter)
+            self.trainer.writer.add_scalar("val/allAcc", all_acc,)# current_iter)
+            self.trainer.writer.add_scalar("val/mPrecision", m_precision,)# current_iter)
+            self.trainer.writer.add_scalar("val/mRecall", m_recall,)# current_iter)
+            self.trainer.writer.add_scalar("val/mF1", m_f1,)# current_iter)
             if self.write_cls_iou:
                 for i in range(self.trainer.cfg.data.num_classes):
                     self.trainer.writer.add_scalar(
                         f"val/cls_{i}-{self.trainer.cfg.data.names[i]} IoU",
                         iou_class[i],
-                        current_epoch,
+                        # current_iter
+                    )
+                    self.trainer.writer.add_scalar(
+                        f"val/cls_{i}-{self.trainer.cfg.data.names[i]} F1",
+                        f1_class[i],
+                        # current_iter
+                    )
+
+                    self.trainer.writer.add_scalar(
+                        f"val/cls_{i}-{self.trainer.cfg.data.names[i]} Precision",
+                        precision_class[i],
+                        # current_iter
+                    )
+
+                    self.trainer.writer.add_scalar(
+                        f"val/cls_{i}-{self.trainer.cfg.data.names[i]} Recall",
+                        recall_class[i],
+                        # current_iter
                     )
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = m_iou  # save for saver
@@ -582,10 +671,177 @@ class InsSegEvaluator(HookBase):
             )
         current_epoch = self.trainer.epoch + 1
         if self.trainer.writer is not None:
-            self.trainer.writer.add_scalar("val/loss", loss_avg, current_epoch)
-            self.trainer.writer.add_scalar("val/mAP", all_ap, current_epoch)
-            self.trainer.writer.add_scalar("val/AP50", all_ap_50, current_epoch)
-            self.trainer.writer.add_scalar("val/AP25", all_ap_25, current_epoch)
+            self.trainer.writer.add_scalar("val/loss", loss_avg)
+            self.trainer.writer.add_scalar("val/mAP", all_ap)
+            self.trainer.writer.add_scalar("val/AP50", all_ap_50)
+            self.trainer.writer.add_scalar("val/AP25", all_ap_25)
         self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
         self.trainer.comm_info["current_metric_value"] = all_ap_50  # save for saver
         self.trainer.comm_info["current_metric_name"] = "AP50"  # save for saver
+
+
+@HOOKS.register_module()
+class BinarySegEvaluator(HookBase):
+    def __init__(self, threshold=0.5, write_metrics=False, every_n_epochs=1):
+        self.threshold = threshold
+        self.write_metrics = write_metrics
+        self.every_n_epochs = every_n_epochs
+
+    def after_epoch(self):
+        if self.trainer.cfg.evaluate:
+            if self.every_n_epochs == 0:
+                self.eval()
+            else:
+                if (self.trainer.epoch + 1) % self.every_n_epochs == 0:
+                    self.eval()
+
+    def eval(self):
+        self.trainer.logger.info(">>>>>>>>>>>>>>>> Start Evaluation >>>>>>>>>>>>>>>>")
+        self.trainer.model.eval()
+        
+        # Store predictions and ground truth
+        all_probs = []
+        all_preds = []
+        all_labels = []
+        
+        for i, input_dict in enumerate(self.trainer.val_loader):
+            for key in input_dict.keys():
+                if isinstance(input_dict[key], torch.Tensor):
+                    input_dict[key] = input_dict[key].cuda(non_blocking=True)
+            
+            with torch.no_grad():
+                output_dict = self.trainer.model(input_dict)
+            
+            # Get binary logits and convert to probabilities
+            logits = output_dict["seg_logits"].squeeze(1)  # Assuming shape [B, 1, N]
+            probs = torch.sigmoid(logits)
+            
+            # Get binary predictions based on threshold
+            preds = (probs > self.threshold).float()
+            
+            # Get ground truth
+            labels = input_dict["query_truth"].float().squeeze(-1)
+            
+            # Handle original coordinate mapping if needed
+            if "origin_coord" in input_dict.keys():
+                idx, _ = pointops.knn_query(
+                    1,
+                    input_dict["coord"].float(),
+                    input_dict["offset"].int(),
+                    input_dict["origin_coord"].float(),
+                    input_dict["origin_offset"].int(),
+                )
+                preds = preds[idx.flatten().long()]
+                probs = probs[idx.flatten().long()]
+                labels = input_dict["origin_segment"].float().squeeze(-1)
+            
+            # Calculate loss
+            loss = output_dict["loss"]
+            
+            # Store for later calculation
+            all_probs.append(probs.cpu())
+            all_preds.append(preds.cpu())
+            all_labels.append(labels.cpu())
+            
+            # Report batch loss
+            self.trainer.storage.put_scalar("val_loss", loss.item())
+            info = "Test: [{iter}/{max_iter}] ".format(
+                iter=i + 1, max_iter=len(self.trainer.val_loader)
+            )
+            if "origin_coord" in input_dict.keys():
+                info = "Interp. " + info
+                
+            self.trainer.logger.info(
+                info + "Loss {loss:.4f} ".format(loss=loss.item())
+            )
+        
+        # Gather results from all processes if distributed
+        if comm.get_world_size() > 1:
+            all_probs_gathered = comm.gather(all_probs, dst=0)
+            all_preds_gathered = comm.gather(all_preds, dst=0)
+            all_labels_gathered = comm.gather(all_labels, dst=0)
+            
+            if comm.get_rank() == 0:
+                all_probs = [p for probs in all_probs_gathered for p in probs]
+                all_preds = [p for preds in all_preds_gathered for p in preds]
+                all_labels = [l for labels in all_labels_gathered for l in labels]
+        
+        # Concatenate all predictions and ground truth
+        all_probs = torch.cat(all_probs, dim=0).numpy()
+        all_preds = torch.cat(all_preds, dim=0).numpy()
+        all_labels = torch.cat(all_labels, dim=0).numpy()
+        
+        # Get average loss
+        loss_avg = self.trainer.storage.history("val_loss").avg
+        
+        # Calculate binary classification metrics
+        true_pos = np.logical_and(all_preds == 1, all_labels == 1).sum()
+        true_neg = np.logical_and(all_preds == 0, all_labels == 0).sum()
+        false_pos = np.logical_and(all_preds == 1, all_labels == 0).sum()
+        false_neg = np.logical_and(all_preds == 0, all_labels == 1).sum()
+        
+        accuracy = (true_pos + true_neg) / (true_pos + true_neg + false_pos + false_neg + 1e-10)
+        precision = true_pos / (true_pos + false_pos + 1e-10)
+        recall = true_pos / (true_pos + false_neg + 1e-10)
+        f1 = 2 * precision * recall / (precision + recall + 1e-10)
+        
+        # Calculate IoU (Jaccard index) for each class
+        iou_pos = true_pos / (true_pos + false_pos + false_neg + 1e-10)  # IoU for positive class
+        iou_neg = true_neg / (true_neg + false_pos + false_neg + 1e-10)  # IoU for negative class
+        m_iou = (iou_pos + iou_neg) / 2  # Mean IoU
+        
+        # Calculate AUC-ROC if sklearn is available
+        try:
+            from sklearn.metrics import roc_auc_score
+            auc_roc = roc_auc_score(all_labels, all_probs)
+        except (ImportError, ValueError):
+            auc_roc = 0.0
+
+        
+        # Log results
+        self.trainer.logger.info(
+            "Val result: Loss/Acc/Prec/Rec/F1/IoU/AUC {:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}/{:.4f}".format(
+                loss_avg, accuracy, precision, recall, f1, m_iou, auc_roc
+            )
+        )
+        
+        # Log confusion matrix
+        self.trainer.logger.info("Confusion Matrix:")
+        self.trainer.logger.info("| Pred \\ GT | Negative | Positive |")
+        self.trainer.logger.info("|-----------|----------|----------|")
+        self.trainer.logger.info("| Negative  | {:8d} | {:8d} |".format(int(true_neg), int(false_neg)))
+        self.trainer.logger.info("| Positive  | {:8d} | {:8d} |".format(int(false_pos), int(true_pos)))
+        
+        # Write to tensorboard
+        if self.trainer.writer is not None:
+            curr_iter = (self.trainer.comm_info["iter"]+1) * (self.trainer.epoch+1)
+            self.trainer.writer.add_scalar("val/loss", loss_avg, curr_iter)
+            self.trainer.writer.add_scalar("val/accuracy", accuracy, curr_iter)
+            self.trainer.writer.add_scalar("val/precision", precision, curr_iter)
+            self.trainer.writer.add_scalar("val/recall", recall, curr_iter)
+            self.trainer.writer.add_scalar("val/f1", f1, curr_iter)
+            self.trainer.writer.add_scalar("val/mIoU", m_iou, curr_iter)
+            self.trainer.writer.add_scalar("val/auc_roc", auc_roc, curr_iter)
+            
+            # Class-specific metrics
+            if self.write_metrics:
+                # Positive class metrics
+                self.trainer.writer.add_scalar("val/cls_positive_iou", iou_pos, curr_iter)
+                self.trainer.writer.add_scalar("val/cls_positive_precision", precision, curr_iter)
+                self.trainer.writer.add_scalar("val/cls_positive_recall", recall, curr_iter)
+                
+                # Negative class metrics
+                self.trainer.writer.add_scalar("val/cls_negative_iou", iou_neg, curr_iter)
+                neg_precision = true_neg / (true_neg + false_neg + 1e-10)
+                neg_recall = true_neg / (true_neg + false_pos + 1e-10)
+                self.trainer.writer.add_scalar("val/cls_negative_precision", neg_precision, curr_iter)
+                self.trainer.writer.add_scalar("val/cls_negative_recall", neg_recall, curr_iter)
+        
+        self.trainer.logger.info("<<<<<<<<<<<<<<<<< End Evaluation <<<<<<<<<<<<<<<<<")
+        self.trainer.comm_info["current_metric_value"] = f1  # save F1 for saver
+        self.trainer.comm_info["current_metric_name"] = "F1"  # save for saver
+
+    def after_train(self):
+        self.trainer.logger.info(
+            "Best {}: {:.4f}".format("F1", self.trainer.best_metric_value)
+        )
