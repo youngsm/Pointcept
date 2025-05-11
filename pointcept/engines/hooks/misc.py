@@ -139,13 +139,15 @@ class InformationWriter(HookBase):
 
 @HOOKS.register_module()
 class CheckpointSaver(HookBase):
-    def __init__(self, save_freq=None):
+    def __init__(self, save_freq=None, evaluator_every_n_epochs=None):
         self.save_freq = save_freq  # None or int, None indicate only save model last
+        self.evaluator_every_n_epochs = evaluator_every_n_epochs
 
     def after_epoch(self):
+        self.trainer.best_metric_value = -1
         if is_main_process():
             is_best = False
-            if self.trainer.cfg.evaluate:
+            if self.trainer.cfg.evaluate and (self.trainer.epoch + 1) % self.evaluator_every_n_epochs == 0:
                 current_metric_value = self.trainer.comm_info["current_metric_value"]
                 current_metric_name = self.trainer.comm_info["current_metric_name"]
                 if current_metric_value > self.trainer.best_metric_value:
@@ -212,6 +214,7 @@ class CheckpointLoader(HookBase):
             checkpoint = torch.load(
                 self.trainer.cfg.weight,
                 map_location=lambda storage, loc: storage.cuda(),
+                weights_only=False,
             )
             self.trainer.logger.info(
                 f"Loading layer weights with keyword: {self.keywords}, "
@@ -243,6 +246,66 @@ class CheckpointLoader(HookBase):
                     self.trainer.scaler.load_state_dict(checkpoint["scaler"])
         else:
             self.trainer.logger.info(f"No weight found at: {self.trainer.cfg.weight}")
+
+@HOOKS.register_module()
+class CheckpointSaverIteration(HookBase):
+    def __init__(self, save_freq=None):
+        self.save_freq = save_freq  # None or int, None indicate only save model last
+
+    def after_step(self):
+        if is_main_process() and self.save_freq and self.trainer.comm_info["iter"] % self.save_freq == 0:
+            is_best = False
+            if self.trainer.cfg.evaluate:
+                current_metric_value = self.trainer.comm_info["current_metric_value"]
+                current_metric_name = self.trainer.comm_info["current_metric_name"]
+                if current_metric_value > self.trainer.best_metric_value:
+                    self.trainer.best_metric_value = current_metric_value
+                    is_best = True
+                    self.trainer.logger.info(
+                        "Best validation {} updated to: {:.4f}".format(
+                            current_metric_name, current_metric_value
+                        )
+                    )
+                self.trainer.logger.info(
+                    "Currently Best {}: {:.4f}".format(
+                        current_metric_name, self.trainer.best_metric_value
+                    )
+                )
+
+            filename = os.path.join(
+                self.trainer.cfg.save_path, "model", "model_last.pth"
+            )
+            self.trainer.logger.info("Saving checkpoint to: " + filename)
+            torch.save(
+                {
+                    "epoch": self.trainer.epoch + 1,
+                    "state_dict": self.trainer.model.state_dict(),
+                    "optimizer": self.trainer.optimizer.state_dict(),
+                    "scheduler": self.trainer.scheduler.state_dict(),
+                    "scaler": (
+                        self.trainer.scaler.state_dict()
+                        if self.trainer.cfg.enable_amp
+                        else None
+                    ),
+                    "best_metric_value": self.trainer.best_metric_value,
+                },
+                filename + ".tmp",
+            )
+            os.replace(filename + ".tmp", filename)
+            if is_best:
+                shutil.copyfile(
+                    filename,
+                    os.path.join(self.trainer.cfg.save_path, "model", "model_best.pth"),
+                )
+            if self.save_freq and (self.trainer.comm_info["iter"] + 1) % self.save_freq == 0:
+                shutil.copyfile(
+                    filename,
+                    os.path.join(
+                        self.trainer.cfg.save_path,
+                        "model",
+                        f"iter_{self.trainer.comm_info['iter'] + 1}.pth",
+                    ),
+                )
 
 
 @HOOKS.register_module()
