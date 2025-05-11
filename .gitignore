@@ -8,6 +8,8 @@ exp
 weights
 data
 log
+wandb
+slurm_logs
 outputs/
 .vscode
 .idea
