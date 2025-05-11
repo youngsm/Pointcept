@@ -6,7 +6,7 @@ Author: Xiaoyang Wu (xiaoyang.wu.cs@gmail.com)
 Please cite our work if the code is helpful to you.
 """
 
-from typing import Optional
+from typing import Optional, Dict, Union
 from itertools import filterfalse
 import torch
 import torch.nn.functional as F
@@ -87,7 +87,7 @@ def _flatten_binary_scores(scores, labels, ignore=None):
 
 
 def _lovasz_softmax(
-    probas, labels, classes="present", class_seen=None, per_image=False, ignore=None
+    probas, labels, classes="present", class_seen=None, class_weights=None, per_image=False, ignore=None
 ):
     """Multi-class Lovasz-Softmax loss
     Args:
@@ -95,6 +95,7 @@ def _lovasz_softmax(
         Interpreted as binary (sigmoid) output with outputs of size [B, H, W].
         @param labels: [B, H, W] Tensor, ground truth labels (between 0 and C - 1)
         @param classes: 'all' for all, 'present' for classes present in labels, or a list of classes to average.
+        @param class_weights: Optional dict, tensor, or list with class weights
         @param per_image: compute the loss per image instead of per batch
         @param ignore: void class labels
     """
@@ -102,7 +103,8 @@ def _lovasz_softmax(
         loss = mean(
             _lovasz_softmax_flat(
                 *_flatten_probas(prob.unsqueeze(0), lab.unsqueeze(0), ignore),
-                classes=classes
+                classes=classes,
+                class_weights=class_weights
             )
             for prob, lab in zip(probas, labels)
         )
@@ -110,23 +112,26 @@ def _lovasz_softmax(
         loss = _lovasz_softmax_flat(
             *_flatten_probas(probas, labels, ignore),
             classes=classes,
-            class_seen=class_seen
+            class_seen=class_seen,
+            class_weights=class_weights
         )
     return loss
 
 
-def _lovasz_softmax_flat(probas, labels, classes="present", class_seen=None):
+def _lovasz_softmax_flat(probas, labels, classes="present", class_seen=None, class_weights=None):
     """Multi-class Lovasz-Softmax loss
     Args:
         @param probas: [P, C] Class probabilities at each prediction (between 0 and 1)
         @param labels: [P] Tensor, ground truth labels (between 0 and C - 1)
         @param classes: 'all' for all, 'present' for classes present in labels, or a list of classes to average.
+        @param class_weights: Optional dict, tensor, or list with class weights
     """
     if probas.numel() == 0:
         # only void pixels, the gradients should be 0
         return probas * 0.0
     C = probas.size(1)
     losses = []
+    class_indices = []
     class_to_sum = list(range(C)) if classes in ["all", "present"] else classes
     # for c in class_to_sum:
     for c in labels.unique():
@@ -145,6 +150,7 @@ def _lovasz_softmax_flat(probas, labels, classes="present", class_seen=None):
             perm = perm.data
             fg_sorted = fg[perm]
             losses.append(torch.dot(errors_sorted, _lovasz_grad(fg_sorted)))
+            class_indices.append(c)
         else:
             if c in class_seen:
                 fg = (labels == c).type_as(probas)  # foreground for class c
@@ -161,6 +167,23 @@ def _lovasz_softmax_flat(probas, labels, classes="present", class_seen=None):
                 perm = perm.data
                 fg_sorted = fg[perm]
                 losses.append(torch.dot(errors_sorted, _lovasz_grad(fg_sorted)))
+                class_indices.append(c)
+    
+    # Apply class weights if provided
+    if class_weights is not None:
+        if isinstance(class_weights, dict):
+            weighted_losses = []
+            for loss, idx in zip(losses, class_indices):
+                weight = class_weights.get(idx.item(), 1.0)
+                weighted_losses.append(loss * weight)
+            return mean(weighted_losses)
+        elif isinstance(class_weights, (torch.Tensor, list)):
+            weighted_losses = []
+            for loss, idx in zip(losses, class_indices):
+                weight = class_weights[idx.item()]
+                weighted_losses.append(loss * weight)
+            return mean(weighted_losses)
+    
     return mean(losses)
 
 
@@ -213,6 +236,7 @@ class LovaszLoss(_Loss):
         self,
         mode: str,
         class_seen: Optional[int] = None,
+        class_weights: Optional[Union[Dict[int, float], torch.Tensor, list]] = None,
         per_image: bool = False,
         ignore_index: Optional[int] = None,
         loss_weight: float = 1.0,
@@ -221,8 +245,11 @@ class LovaszLoss(_Loss):
         It supports binary, multiclass and multilabel cases
         Args:
             mode: Loss mode 'binary', 'multiclass' or 'multilabel'
+            class_seen: Optional list of classes to include in loss calculation
+            class_weights: Optional class weights (dict mapping class idx to weight, tensor, or list)
             ignore_index: Label that indicates ignored pixels (does not contribute to loss)
             per_image: If True loss computed per each image and then averaged, else computed per whole batch
+            loss_weight: Global weight for the loss
         Shape
              - **y_pred** - torch.Tensor of shape (N, C, H, W)
              - **y_true** - torch.Tensor of shape (N, H, W) or (N, C, H, W)
@@ -236,6 +263,7 @@ class LovaszLoss(_Loss):
         self.ignore_index = ignore_index
         self.per_image = per_image
         self.class_seen = class_seen
+        self.class_weights = class_weights
         self.loss_weight = loss_weight
 
     def forward(self, y_pred, y_true):
@@ -249,6 +277,7 @@ class LovaszLoss(_Loss):
                 y_pred,
                 y_true,
                 class_seen=self.class_seen,
+                class_weights=self.class_weights,
                 per_image=self.per_image,
                 ignore=self.ignore_index,
             )

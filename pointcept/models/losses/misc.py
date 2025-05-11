@@ -8,6 +8,7 @@ Please cite our work if the code is helpful to you.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Optional, Dict, Union
 from .builder import LOSSES
 
 
@@ -36,7 +37,7 @@ class CrossEntropyLoss(nn.Module):
         )
 
     def forward(self, pred, target):
-        return self.loss(pred, target) * self.loss_weight
+        return self.loss(pred, target.squeeze(-1)) * self.loss_weight
 
 
 @LOSSES.register_module()
@@ -58,7 +59,7 @@ class SmoothCELoss(nn.Module):
 
 @LOSSES.register_module()
 class BinaryFocalLoss(nn.Module):
-    def __init__(self, gamma=2.0, alpha=0.5, logits=True, reduce=True, loss_weight=1.0):
+    def __init__(self, gamma=2.0, alpha=0.5, logits=True, reduce=True, loss_weight=1.0, weight=None):
         """Binary Focal Loss
         <https://arxiv.org/abs/1708.02002>`
         """
@@ -69,6 +70,7 @@ class BinaryFocalLoss(nn.Module):
         self.logits = logits
         self.reduce = reduce
         self.loss_weight = loss_weight
+        self.weight = weight
 
     def forward(self, pred, target, **kwargs):
         """Forward function.
@@ -81,9 +83,9 @@ class BinaryFocalLoss(nn.Module):
             torch.Tensor: The calculated loss
         """
         if self.logits:
-            bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none")
+            bce = F.binary_cross_entropy_with_logits(pred, target, reduction="none", weight=self.weight)
         else:
-            bce = F.binary_cross_entropy(pred, target, reduction="none")
+            bce = F.binary_cross_entropy(pred, target, reduction="none", weight=self.weight)
         pt = torch.exp(-bce)
         alpha = self.alpha * target + (1 - self.alpha) * (1 - target)
         focal_loss = alpha * (1 - pt) ** self.gamma * bce
