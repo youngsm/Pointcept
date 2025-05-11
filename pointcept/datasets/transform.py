@@ -144,26 +144,44 @@ class NormalizeColor(object):
 
 @TRANSFORMS.register_module()
 class NormalizeCoord(object):
+    def __init__(self, center=None, scale=None):
+        self.center = center
+        self.scale = scale
+
     def __call__(self, data_dict):
         if "coord" in data_dict.keys():
             # modified from pointnet2
-            centroid = np.mean(data_dict["coord"], axis=0)
-            data_dict["coord"] -= centroid
-            m = np.max(np.sqrt(np.sum(data_dict["coord"] ** 2, axis=1)))
-            data_dict["coord"] = data_dict["coord"] / m
+            if self.center is None:
+                centroid = np.mean(data_dict["coord"], axis=0)
+                data_dict["coord"] -= centroid
+            else:
+                centroid = np.array(self.center)
+                data_dict["coord"] -= centroid
+            
+            if self.scale is None:
+                m = np.max(np.sqrt(np.sum(data_dict["coord"] ** 2, axis=1)))
+                data_dict["coord"] = data_dict["coord"] / m
+            else:
+                data_dict["coord"] = data_dict["coord"] / self.scale
         return data_dict
 
 @TRANSFORMS.register_module()
-class NormalizePILArNet(object):
-    def __call__(self, data_dict):
-        if "coord" in data_dict.keys():
-            # modified from pointnet2
-            centroid = np.array([384.0, 384.0, 384.0])
-            data_dict["coord"] -= centroid
-            m = 768 * np.sqrt(3) / 2
-            data_dict["coord"] = data_dict["coord"] / m
-        return data_dict
+class LogTransform(object):
+    def __init__(self, min_val=1.0e-2, max_val=20.0):
+        self.min_val = min_val
+        self.max_val = max_val
 
+    def log_transform(self, x):
+        """Transform energy to logarithmic scale on [-1,1]"""
+        # [emin, emax] -> [-1,1]
+        y0 = np.log10(self.min_val)
+        y1 = np.log10(self.max_val + self.min_val)
+        return 2 * (np.log10(x + self.min_val) - y0) / (y1 - y0) - 1
+
+    def __call__(self, data_dict):
+        if "energy" in data_dict.keys():
+            data_dict["energy"] = self.log_transform(data_dict["energy"])
+        return data_dict
 
 @TRANSFORMS.register_module()
 class PositiveShift(object):
